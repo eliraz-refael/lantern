@@ -801,9 +801,13 @@ pub(crate) mod tests {
         let mut index = Index::open_in_memory().unwrap();
         index.light(&dir).unwrap();
         index.scan().unwrap();
-        for name in ["Secrets/dev.txt", "codes.txt", "login.txt"] {
-            let info = index.file(&dir.join(name)).unwrap().unwrap();
-            assert_eq!(info.state, State::Sensitive, "{name}");
+        for path in [
+            dir.join("Secrets").join("dev.txt"),
+            dir.join("codes.txt"),
+            dir.join("login.txt"),
+        ] {
+            let info = index.file(&path).unwrap().unwrap();
+            assert_eq!(info.state, State::Sensitive, "{}", path.display());
         }
         assert!(index.pending(10).unwrap().is_empty());
         fs::remove_dir_all(dir).unwrap();
