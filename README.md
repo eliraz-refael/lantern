@@ -24,3 +24,7 @@ cargo run -p lantern-tui      # h/j/k/l to move, q to quit
 ```
 
 CI builds and tests on macOS, Windows and Linux.
+
+## License
+
+[MIT](LICENSE)
