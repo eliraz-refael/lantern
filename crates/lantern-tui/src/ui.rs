@@ -225,11 +225,9 @@ fn preview(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::styled(entry.name.clone(), fg(if is_image { IMAGE } else { FG })),
         Line::styled(details, fg(DIM)),
         status,
-        rule,
     ];
     if is_image {
         // The image goes on top with its details right underneath, as in the mockup.
-        lines.truncate(3);
         let path = entry.path.clone();
         let max_height = area.height.saturating_sub(lines.len() as u16 + 1);
         let used = match app.images.get(&path) {
@@ -265,6 +263,7 @@ fn preview(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new(lines), below);
         return;
     }
+    lines.push(rule);
     match files::text_head(&entry.path, area.height as usize) {
         Some(text) => lines.extend(text.into_iter().map(|l| Line::styled(l, fg(FG)))),
         None => lines.push(Line::styled("binary file", fg(DIM))),

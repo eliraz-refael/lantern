@@ -22,7 +22,7 @@ fn main() -> anyhow::Result<()> {
     let db = Index::default_path().context("could not determine a home directory")?;
     let index = Index::open(&db).with_context(|| format!("opening {}", db.display()))?;
     let cwd = std::env::current_dir()?;
-    enable_tmux_passthrough();
+    let tmux = enable_tmux_passthrough();
     let mut terminal = ratatui::init();
     // Ask the terminal which image protocol it speaks (Kitty, Sixel, iTerm2), else use half-blocks.
     // This has to happen after entering the alternate screen and before reading any events.
@@ -30,17 +30,54 @@ fn main() -> anyhow::Result<()> {
     let result =
         App::new(index, cwd, Images::new(picker)).and_then(|mut app| app.run(&mut terminal));
     ratatui::restore();
+    if let Some(tmux) = tmux {
+        tmux.restore();
+    }
     result
 }
 
 /// Inside tmux, images only reach the real terminal with passthrough on. ratatui-image turns it on
 /// without naming a pane, which tmux applies to the active pane rather than ours, so target ours.
-fn enable_tmux_passthrough() {
-    let Ok(pane) = std::env::var("TMUX_PANE") else {
-        return;
-    };
+/// Returns what's needed to put the pane's previous setting back on exit.
+fn enable_tmux_passthrough() -> Option<TmuxPassthrough> {
+    let pane = std::env::var("TMUX_PANE").ok()?;
+    let output = std::process::Command::new("tmux")
+        .args(["show", "-p", "-v", "-t", &pane, "allow-passthrough"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let previous = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    tmux(&["set", "-p", "-t", &pane, "allow-passthrough", "on"]);
+    Some(TmuxPassthrough { pane, previous })
+}
+
+/// The pane's own `allow-passthrough` value before we changed it; empty if it wasn't set.
+struct TmuxPassthrough {
+    pane: String,
+    previous: String,
+}
+
+impl TmuxPassthrough {
+    fn restore(self) {
+        if self.previous.is_empty() {
+            tmux(&["set", "-p", "-u", "-t", &self.pane, "allow-passthrough"]);
+        } else {
+            tmux(&[
+                "set",
+                "-p",
+                "-t",
+                &self.pane,
+                "allow-passthrough",
+                &self.previous,
+            ]);
+        }
+    }
+}
+
+fn tmux(args: &[&str]) {
     let _ = std::process::Command::new("tmux")
-        .args(["set", "-p", "-t", &pane, "allow-passthrough", "on"])
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -90,9 +127,9 @@ impl App {
             if redraw {
                 terminal.draw(|frame| ui::draw(frame, self))?;
             }
-            redraw = self.images.receive();
-            // Wake up regularly to pick up images decoded in the background.
-            if !event::poll(Duration::from_millis(50))? {
+            // While an image is decoding, wake up regularly to pick it up; otherwise wait for input.
+            if self.images.is_loading() && !event::poll(Duration::from_millis(50))? {
+                redraw = self.images.receive();
                 continue;
             }
             redraw = true;

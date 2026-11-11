@@ -1,15 +1,20 @@
 //! Image previews. Decoding happens on a background thread so scrolling past large photos stays smooth.
 
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
+use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageError, ImageReader};
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 
 /// Images are scaled down to at most this many pixels per side before display.
 const MAX_SIDE: u32 = 1200;
+
+/// Name of the decoder thread, so its panics can be told apart from the UI thread's.
+const WORKER: &str = "image-decoder";
 
 type Decoded = (PathBuf, Result<DynamicImage, String>);
 
@@ -31,18 +36,30 @@ impl Images {
     pub fn new(picker: Picker) -> Self {
         let (requests, worker_requests) = mpsc::channel::<PathBuf>();
         let (worker_results, results) = mpsc::channel::<Decoded>();
-        thread::spawn(move || {
-            while let Ok(mut path) = worker_requests.recv() {
-                // When scrolling quickly, only the latest request matters.
-                while let Ok(newer) = worker_requests.try_recv() {
-                    path = newer;
-                }
-                let result = decode(&path);
-                if worker_results.send((path, result)).is_err() {
-                    break;
-                }
+        // A decoder panic on a malformed file must not run the terminal-restoring panic hook
+        // while the UI keeps going; it is caught below and shown as a failed preview instead.
+        let previous_hook = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if thread::current().name() != Some(WORKER) {
+                previous_hook(info);
             }
-        });
+        }));
+        thread::Builder::new()
+            .name(WORKER.into())
+            .spawn(move || {
+                while let Ok(mut path) = worker_requests.recv() {
+                    // When scrolling quickly, only the latest request matters.
+                    while let Ok(newer) = worker_requests.try_recv() {
+                        path = newer;
+                    }
+                    let result = panic::catch_unwind(AssertUnwindSafe(|| decode(&path)))
+                        .unwrap_or_else(|_| Err("can't preview: the decoder crashed".to_string()));
+                    if worker_results.send((path, result)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("could not start the image decoder thread");
         Self {
             picker,
             requests,
@@ -69,6 +86,11 @@ impl Images {
         self.current = Some((path.to_owned(), Preview::Loading));
         // The worker only stops when `self` is dropped, so this can't fail while we're alive.
         let _ = self.requests.send(path.to_owned());
+    }
+
+    /// Whether the current preview is still being decoded.
+    pub fn is_loading(&self) -> bool {
+        matches!(self.current, Some((_, Preview::Loading)))
     }
 
     /// Picks up finished decodes. Returns true if the current preview changed.
@@ -104,7 +126,8 @@ fn decode(path: &Path) -> Result<DynamicImage, String> {
             .with_guessed_format()?
             .into_decoder()?;
         // Phone photos are often stored sideways with an EXIF flag saying how to rotate them.
-        let orientation = decoder.orientation()?;
+        // A malformed EXIF block shouldn't cost the whole preview.
+        let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
         let mut image = DynamicImage::from_decoder(decoder)?.thumbnail(MAX_SIDE, MAX_SIDE);
         image.apply_orientation(orientation);
         Ok(image)
