@@ -6,7 +6,7 @@ mod ui;
 
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use lantern_core::{AgentStatus, Counts, Index};
@@ -106,7 +106,7 @@ struct App {
     /// One-line message shown in the footer until the next key press.
     status: Option<String>,
     images: Images,
-    last_reload: SystemTime,
+    last_reload: Instant,
 }
 
 impl App {
@@ -124,7 +124,7 @@ impl App {
             show_hidden: false,
             status: None,
             images,
-            last_reload: SystemTime::UNIX_EPOCH,
+            last_reload: Instant::now(),
         };
         app.reload_index()?;
         app.open(cwd, None);
@@ -147,7 +147,7 @@ impl App {
             };
             if !event::poll(wait)? {
                 redraw = self.images.receive();
-                if self.last_reload.elapsed().is_ok_and(|e| e >= REFRESH) {
+                if self.last_reload.elapsed() >= REFRESH {
                     redraw |= self.reload_index()?;
                 }
                 continue;
@@ -282,7 +282,7 @@ impl App {
         self.lit = lit;
         self.counts = counts;
         self.agent = agent;
-        self.last_reload = SystemTime::now();
+        self.last_reload = Instant::now();
         Ok(changed)
     }
 

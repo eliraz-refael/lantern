@@ -11,8 +11,38 @@ pub const TEXT_LIMIT: usize = 64 * 1024;
 /// Larger images are left out rather than decoded.
 const IMAGE_LIMIT: u64 = 50 * 1024 * 1024;
 
-/// Folders that are never worth describing, besides hidden ones.
-const SKIPPED_DIRS: &[&str] = &["node_modules", "__pycache__"];
+/// Folders that are never worth describing, besides hidden ones: installed dependencies.
+const SKIPPED_DIRS: &[&str] = &[
+    "node_modules",
+    "bower_components",
+    "vendor",
+    "venv",
+    "site-packages",
+    "__pycache__",
+];
+
+/// Generated files that say nothing about what a folder is for.
+const SKIPPED_FILES: &[&str] = &[
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lockb",
+    "Cargo.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+    "Gemfile.lock",
+    "composer.lock",
+    "go.sum",
+    "flake.lock",
+];
+
+/// Whether a file is generated or minified rather than written by someone.
+fn is_generated(name: &str) -> bool {
+    SKIPPED_FILES.contains(&name)
+        || name.ends_with(".min.js")
+        || name.ends_with(".min.css")
+        || name.ends_with(".map")
+}
 
 const IMAGE_EXTENSIONS: &[&str] = &["bmp", "gif", "jpeg", "jpg", "png", "tif", "tiff", "webp"];
 
@@ -47,10 +77,10 @@ pub(crate) struct Seen {
 }
 
 /// Collects the visible regular files under `root`. Symlinks are skipped so a walk never leaves the
-/// folder, and `other_roots` are left to their own walk.
-pub(crate) fn walk(root: &Path, other_roots: &[PathBuf], out: &mut Vec<Seen>) {
+/// folder, and `other_roots` are left to their own walk. Returns false if `root` can't be read.
+pub(crate) fn walk(root: &Path, other_roots: &[PathBuf], out: &mut Vec<Seen>) -> bool {
     let Ok(read) = fs::read_dir(root) else {
-        return;
+        return false;
     };
     for entry in read.filter_map(Result::ok) {
         let name = entry.file_name();
@@ -67,6 +97,7 @@ pub(crate) fn walk(root: &Path, other_roots: &[PathBuf], out: &mut Vec<Seen>) {
                 walk(&path, other_roots, out);
             }
         } else if file_type.is_file()
+            && !is_generated(&name)
             && let Ok(meta) = entry.metadata()
         {
             let modified = meta
@@ -81,18 +112,20 @@ pub(crate) fn walk(root: &Path, other_roots: &[PathBuf], out: &mut Vec<Seen>) {
             });
         }
     }
+    true
 }
 
-/// What kind of file this is, or None if an agent can't read it yet (PDFs, archives, video...).
-pub(crate) fn classify(path: &Path, size: u64) -> io::Result<Option<FileKind>> {
+/// What kind of file this is, with the text an agent would see for text files, or None if an
+/// agent can't read it yet (PDFs, archives, video...).
+pub(crate) fn classify(path: &Path, size: u64) -> io::Result<Option<(FileKind, Option<String>)>> {
     let is_image = path
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
     if is_image {
-        return Ok((size <= IMAGE_LIMIT).then_some(FileKind::Image));
+        return Ok((size <= IMAGE_LIMIT).then_some((FileKind::Image, None)));
     }
-    Ok(read_text(path)?.map(|_| FileKind::Text))
+    Ok(read_text(path)?.map(|text| (FileKind::Text, Some(text))))
 }
 
 /// The first [`TEXT_LIMIT`] bytes of a file as text, or None if it looks binary.
@@ -126,6 +159,9 @@ mod tests {
         fs::create_dir_all(dir.join("a/.git")).unwrap();
         fs::create_dir_all(dir.join("b")).unwrap();
         fs::write(dir.join("a/one.txt"), "1").unwrap();
+        fs::write(dir.join("a/package-lock.json"), "{}").unwrap();
+        fs::create_dir_all(dir.join("a/node_modules/x")).unwrap();
+        fs::write(dir.join("a/node_modules/x/index.js"), "x").unwrap();
         fs::write(dir.join("a/.git/config"), "x").unwrap();
         fs::write(dir.join(".hidden"), "x").unwrap();
         fs::write(dir.join("b/two.txt"), "2").unwrap();

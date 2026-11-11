@@ -67,6 +67,8 @@ async fn main() -> anyhow::Result<()> {
         Some(db) => db,
         None => Index::default_path().context("could not determine a home directory")?,
     };
+    // The agent starts the MCP server in its own folder, so a relative path would name another file.
+    let db = std::path::absolute(&db).with_context(|| format!("resolving {}", db.display()))?;
     let agent_name = args.agent.as_deref().unwrap_or("claude");
     let spec = agent::find(agent_name).with_context(|| {
         let known: Vec<_> = agent::AGENTS.iter().map(|a| a.name).collect();

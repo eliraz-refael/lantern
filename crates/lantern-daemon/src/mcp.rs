@@ -138,6 +138,20 @@ fn read(index: &Mutex<Index>, path: &Path) -> Result<Vec<ContentBlock>, String> 
                 path.display()
             )
         })?;
+    // Scanning skips symlinks; one swapped in since then could point anywhere.
+    let is_file = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("can't read {}: {e}", path.display()))?
+        .is_file();
+    if !is_file {
+        return Err(format!("{} is no longer a regular file", path.display()));
+    }
+    if let Some(reason) = sensitive::by_path(path) {
+        let _ = index.lock().unwrap().mark_sensitive(path, reason);
+        return Err(format!(
+            "{} looks like {reason}, so it stays local",
+            path.display()
+        ));
+    }
     match kind {
         FileKind::Text => {
             let text = scan::read_text(path)

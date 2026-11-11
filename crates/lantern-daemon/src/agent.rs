@@ -124,7 +124,17 @@ pub async fn run(run: Run<'_>, index: Arc<Mutex<Index>>, status: &Status) -> any
                     return Ok(());
                 }
                 let paths: Vec<PathBuf> = batch.into_iter().map(|(path, _)| path).collect();
-                // Counted up front, so a file that crashes the agent is eventually given up on.
+                let session = cx
+                    .send_request(
+                        NewSessionRequest::new(workspace.clone())
+                            .mcp_servers(vec![mcp.clone()])
+                            .meta(meta.clone()),
+                    )
+                    .block_task()
+                    .await?;
+                // Counted once the agent took a session but before the prompt, so a file that
+                // crashes the agent is eventually given up on, while an agent that can't start a
+                // session (not logged in, say) doesn't use up the files' attempts.
                 index
                     .lock()
                     .unwrap()
@@ -138,15 +148,6 @@ pub async fn run(run: Run<'_>, index: Arc<Mutex<Index>>, status: &Status) -> any
                         paths.len()
                     )),
                 );
-
-                let session = cx
-                    .send_request(
-                        NewSessionRequest::new(workspace.clone())
-                            .mcp_servers(vec![mcp.clone()])
-                            .meta(meta.clone()),
-                    )
-                    .block_task()
-                    .await?;
                 let prompt = ContentBlock::Text(TextContent::new(prompt(&paths)));
                 let response = cx
                     .send_request(PromptRequest::new(session.session_id, vec![prompt]))
@@ -175,10 +176,14 @@ pub fn explain(spec: &Spec, error: &anyhow::Error) -> String {
 fn answer_permission(request: &RequestPermissionRequest) -> RequestPermissionResponse {
     let fields = &request.tool_call.fields;
     let named = [fields.name.as_deref(), fields.title.as_deref()];
-    let ours = named
-        .into_iter()
-        .flatten()
-        .any(|name| name.contains("lantern") && TOOLS.iter().any(|tool| name.contains(tool)));
+    // Matched exactly as each agent names MCP tools, not by substring: a built-in tool's title
+    // can mention a path that happens to contain "lantern" and "read_file".
+    let ours = named.into_iter().flatten().any(|name| {
+        TOOLS.iter().any(|tool| {
+            name == format!("mcp__lantern__{tool}")
+                || name.starts_with(&format!("{tool} (lantern MCP Server)"))
+        })
+    });
     let wanted = if ours {
         PermissionOptionKind::AllowOnce
     } else {
@@ -294,5 +299,9 @@ mod tests {
             Some("reject")
         );
         assert_eq!(allow("Shell: cat ~/.ssh/id_rsa").as_deref(), Some("reject"));
+        assert_eq!(
+            allow("ReadFile /Users/me/lantern/read_file.md").as_deref(),
+            Some("reject")
+        );
     }
 }

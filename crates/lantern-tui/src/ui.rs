@@ -109,12 +109,11 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
         Some(_) => left.push(Span::styled(" ✦", fg(AMBER_DIM))),
         None => {}
     }
-    let right = Line::from(vec![
+    let mut right = Line::from(vec![
         Span::styled("images: ", fg(DIM)),
         Span::styled(app.images.protocol_name(), fg(FG)),
         sep(),
     ]);
-    let mut right = right;
     right.spans.extend(agent_spans(app));
     right.spans.extend([
         sep(),

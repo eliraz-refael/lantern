@@ -241,6 +241,8 @@ impl Index {
     pub fn scan(&mut self) -> Result<ScanReport> {
         let roots = self.lit_folders()?;
         let mut seen = Vec::new();
+        // A root that can't be read (an unmounted drive, say) keeps what's known about it.
+        let mut unreadable = Vec::new();
         for (i, root) in roots.iter().enumerate() {
             let others: Vec<PathBuf> = roots
                 .iter()
@@ -248,7 +250,9 @@ impl Index {
                 .filter(|&(j, _)| j != i)
                 .map(|(_, r)| r.clone())
                 .collect();
-            scan::walk(root, &others, &mut seen);
+            if !scan::walk(root, &others, &mut seen) {
+                unreadable.push(root.clone());
+            }
         }
 
         let known: HashMap<String, (i64, i64, String)> = {
@@ -262,7 +266,6 @@ impl Index {
         };
 
         // Read and hash new or changed files before taking the write lock.
-        let mut report = ScanReport::default();
         let mut present = HashSet::new();
         let mut touched = Vec::new();
         let mut upserts = Vec::new();
@@ -278,7 +281,7 @@ impl Index {
                 }
                 _ => {}
             }
-            let Ok(Some(kind)) = scan::classify(&file.path, file.size) else {
+            let Ok(Some((kind, text))) = scan::classify(&file.path, file.size) else {
                 continue;
             };
             let Ok(hash) = hash_file(&file.path) else {
@@ -287,35 +290,45 @@ impl Index {
             match known.get(&path) {
                 // Touched but not changed: keep the description.
                 Some((_, _, h)) if *h == hash => touched.push((path.clone(), size, file.modified)),
-                Some(_) => {
-                    report.changed += 1;
-                    upserts.push((path.clone(), kind, size, file.modified, hash));
-                }
-                None => {
-                    report.added += 1;
-                    upserts.push((path.clone(), kind, size, file.modified, hash));
+                previous => {
+                    let sensitive = sensitivity(&file.path, text.as_deref());
+                    let is_new = previous.is_none();
+                    upserts.push((
+                        path.clone(),
+                        kind,
+                        size,
+                        file.modified,
+                        hash,
+                        sensitive,
+                        is_new,
+                    ));
                 }
             }
             present.insert(path);
         }
-        let upserts: Vec<_> = upserts
-            .into_iter()
-            .map(|(path, kind, size, modified, hash)| {
-                let sensitive = sensitivity(Path::new(&path), kind);
-                (path, kind, size, modified, hash, sensitive)
-            })
-            .collect();
 
+        let mut report = ScanReport::default();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A folder may have been unlit while the scan was reading; its files stay out.
+        let lit_now = lit_folders(&tx)?;
+        let still_lit = |path: &str| lit_now.iter().any(|r| Path::new(path).starts_with(r));
         for (path, size, modified) in touched {
             tx.execute(
                 "UPDATE files SET size = ?2, modified = ?3 WHERE path = ?1",
                 params![path, size, modified],
             )?;
         }
-        for (path, kind, size, modified, hash, sensitive) in upserts {
+        for (path, kind, size, modified, hash, sensitive, is_new) in upserts {
+            if !still_lit(&path) {
+                continue;
+            }
+            if is_new {
+                report.added += 1;
+            } else {
+                report.changed += 1;
+            }
             let state = if sensitive.is_some() {
                 State::Sensitive
             } else {
@@ -340,9 +353,20 @@ impl Index {
                 ],
             )?;
         }
-        for path in known.keys().filter(|p| !present.contains(*p)) {
+        let gone = known.keys().filter(|p| {
+            !present.contains(*p) && !unreadable.iter().any(|r| Path::new(p).starts_with(r))
+        });
+        for path in gone {
             tx.execute("DELETE FROM files WHERE path = ?1", params![path])?;
             report.removed += 1;
+        }
+        // Detection gets stricter over time: a known file whose path now looks like it holds
+        // credentials is pulled back, with whatever the agent wrote about it.
+        let flagged = present
+            .iter()
+            .filter_map(|p| Some((p, sensitive::by_path(Path::new(p))?)));
+        for (path, reason) in flagged {
+            mark_sensitive(&tx, path, reason)?;
         }
         tx.commit()?;
         Ok(report)
@@ -419,13 +443,7 @@ impl Index {
 
     /// Flags a file as sensitive after it was found to hold a secret on its way to the agent.
     pub fn mark_sensitive(&self, path: &Path, reason: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE files SET state = 'sensitive', note = ?2, title = NULL, summary = NULL,
-                tags = NULL, agent = NULL, indexed_at = NULL
-             WHERE path = ?1",
-            params![path_str(path)?, reason],
-        )?;
-        Ok(())
+        mark_sensitive(&self.conn, path_str(path)?, reason)
     }
 
     pub fn file(&self, path: &Path) -> Result<Option<FileInfo>> {
@@ -474,19 +492,26 @@ impl Index {
 
     /// File counts under `folder`, or across the whole index.
     pub fn counts(&self, folder: Option<&Path>) -> Result<Counts> {
-        let (lo, hi) = match folder {
-            Some(f) => subtree(path_str(f)?),
-            None => (String::new(), "\u{10FFFF}".to_owned()),
+        let row = |row: &rusqlite::Row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?));
+        let rows: Vec<(String, i64)> = match folder {
+            Some(f) => {
+                let (lo, hi) = subtree(path_str(f)?);
+                self.conn
+                    .prepare(
+                        "SELECT state, COUNT(*) FROM files WHERE path >= ?1 AND path < ?2
+                         GROUP BY state",
+                    )?
+                    .query_map(params![lo, hi], row)?
+                    .collect::<rusqlite::Result<_>>()?
+            }
+            None => self
+                .conn
+                .prepare("SELECT state, COUNT(*) FROM files GROUP BY state")?
+                .query_map([], row)?
+                .collect::<rusqlite::Result<_>>()?,
         };
-        let mut stmt = self.conn.prepare(
-            "SELECT state, COUNT(*) FROM files WHERE path >= ?1 AND path < ?2 GROUP BY state",
-        )?;
-        let rows = stmt.query_map(params![lo, hi], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
         let mut counts = Counts::default();
-        for row in rows {
-            let (state, n) = row?;
+        for (state, n) in rows {
             let n = n as u64;
             match State::parse(&state) {
                 State::Pending => counts.pending += n,
@@ -548,6 +573,17 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// Keeps a file from the agent and forgets anything it already wrote about it.
+fn mark_sensitive(conn: &Connection, path: &str, reason: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE files SET state = 'sensitive', note = ?2, title = NULL, summary = NULL,
+            tags = NULL, agent = NULL, indexed_at = NULL
+         WHERE path = ?1",
+        params![path, reason],
+    )?;
+    Ok(())
+}
+
 fn lit_folders(conn: &Connection) -> Result<Vec<PathBuf>> {
     let mut stmt = conn.prepare("SELECT path FROM lit_folders ORDER BY path")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -557,15 +593,8 @@ fn lit_folders(conn: &Connection) -> Result<Vec<PathBuf>> {
 }
 
 /// Why a file must stay local, judged by its name and, for text, the part an agent would see.
-fn sensitivity(path: &Path, kind: FileKind) -> Option<&'static str> {
-    let name = path.file_name()?.to_str()?;
-    sensitive::by_name(name).or_else(|| match kind {
-        FileKind::Text => scan::read_text(path)
-            .ok()
-            .flatten()
-            .and_then(|text| sensitive::in_text(&text)),
-        FileKind::Image => None,
-    })
+fn sensitivity(path: &Path, text: Option<&str>) -> Option<&'static str> {
+    sensitive::by_path(path).or_else(|| text.and_then(sensitive::in_text))
 }
 
 /// Bounds for a range query matching every path inside `folder`: `lo <= path < hi`.
@@ -708,6 +737,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_unreadable_folder_keeps_its_files() {
+        let dir = tempdir("unreadable");
+        let folder = dir.join("drive");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("a.txt"), "a").unwrap();
+        let mut index = Index::open_in_memory().unwrap();
+        index.light(&folder).unwrap();
+        index.scan().unwrap();
+
+        // Like an external drive being unmounted.
+        fs::rename(&folder, dir.join("away")).unwrap();
+        assert_eq!(index.scan().unwrap().removed, 0);
+        assert!(index.file(&folder.join("a.txt")).unwrap().is_some());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn files_are_given_up_on_after_repeated_attempts() {
         let dir = tempdir("attempts");
         let path = dir.join("a.txt");
@@ -726,6 +772,24 @@ pub(crate) mod tests {
                 .describe(&path, &Description::default(), "test")
                 .unwrap()
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn credential_folders_and_recovery_codes_stay_local() {
+        let dir = tempdir("credentials");
+        fs::create_dir_all(dir.join("Secrets")).unwrap();
+        fs::write(dir.join("Secrets/dev.txt"), "server: dev.example.com").unwrap();
+        fs::write(dir.join("codes.txt"), "1a2b3-4c5d6\n7e8f9-0a1b2").unwrap();
+        fs::write(dir.join("login.txt"), "user: me\npassword: hunter22").unwrap();
+        let mut index = Index::open_in_memory().unwrap();
+        index.light(&dir).unwrap();
+        index.scan().unwrap();
+        for name in ["Secrets/dev.txt", "codes.txt", "login.txt"] {
+            let info = index.file(&dir.join(name)).unwrap().unwrap();
+            assert_eq!(info.state, State::Sensitive, "{name}");
+        }
+        assert!(index.pending(10).unwrap().is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 
