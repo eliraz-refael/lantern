@@ -4,8 +4,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table, TableState, Wrap};
 use ratatui_image::{FilterType, Resize, StatefulImage};
+
+use lantern_core::{AgentState, Counts, State};
 
 use crate::App;
 use crate::files::{self, Entry, Kind};
@@ -23,6 +25,8 @@ const SELECTED_BG: Color = Color::Rgb(0x33, 0x27, 0x0f);
 const PARENT_BG: Color = Color::Rgb(0x26, 0x26, 0x2b);
 const FOOTER_BG: Color = Color::Rgb(0x14, 0x14, 0x16);
 const ON_AMBER: Color = Color::Rgb(0x1a, 0x12, 0x05);
+const GREEN: Color = Color::Rgb(0x9c, 0xcc, 0x65);
+const RED: Color = Color::Rgb(0xff, 0x6b, 0x5b);
 
 fn fg(color: Color) -> Style {
     Style::new().fg(color)
@@ -85,6 +89,7 @@ fn split_line(frame: &mut Frame, area: Rect, left: Line, right: Line) {
         Constraint::Fill(1),
         Constraint::Length(right.width() as u16),
     ])
+    .spacing(1)
     .areas(area);
     frame.render_widget(left, l);
     frame.render_widget(right, r);
@@ -104,19 +109,64 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
         Some(_) => left.push(Span::styled(" ✦", fg(AMBER_DIM))),
         None => {}
     }
-    let right = Line::from(vec![
+    let mut right = Line::from(vec![
         Span::styled("images: ", fg(DIM)),
         Span::styled(app.images.protocol_name(), fg(FG)),
         sep(),
-        Span::styled("no agent", fg(DIM)),
+    ]);
+    right.spans.extend(agent_spans(app));
+    right.spans.extend([
         sep(),
         Span::styled(app.lit.len().to_string(), fg(FG)),
         Span::styled(" lit", fg(DIM)),
         sep(),
-        Span::styled(app.indexed.to_string(), fg(FG)),
+        Span::styled(app.counts.indexed.to_string(), fg(FG)),
         Span::styled(" indexed ", fg(DIM)),
     ]);
     split_line(frame, inner, Line::from(left), right);
+}
+
+/// "claude ● idle", "claude ◐ describing 8 files · 40 left", or "no agent".
+fn agent_spans(app: &App) -> Vec<Span<'static>> {
+    let Some(agent) = &app.agent else {
+        return vec![Span::styled("no agent", fg(DIM))];
+    };
+    let (dot, color) = match agent.state {
+        AgentState::Idle => ("●", GREEN),
+        AgentState::Working => ("◐", AMBER),
+        AgentState::Error => ("✕", RED),
+    };
+    let mut detail = agent.detail.clone().unwrap_or_else(|| "idle".into());
+    if agent.state == AgentState::Working && app.counts.pending > 0 {
+        detail += &format!(" · {} left", app.counts.pending);
+    }
+    vec![
+        Span::styled(agent.agent.clone(), fg(FG)),
+        Span::styled(format!(" {dot} "), fg(color)),
+        Span::styled(detail, fg(DIM)),
+    ]
+}
+
+/// "· 12 of 40 indexed · 2 kept local" for a lit folder.
+fn progress(counts: Counts) -> String {
+    let total = counts.pending + counts.indexed + counts.failed;
+    let mut text = if counts.pending == 0 && total > 0 {
+        format!(
+            " · {} indexed",
+            files::plural(counts.indexed as usize, "file")
+        )
+    } else if total == 0 && counts.sensitive == 0 {
+        " · nothing to index".into()
+    } else {
+        format!(" · {} of {total} indexed", counts.indexed)
+    };
+    if counts.sensitive > 0 {
+        text += &format!(" · {} kept local", counts.sensitive);
+    }
+    if counts.failed > 0 {
+        text += &format!(" · {} failed", counts.failed);
+    }
+    text
 }
 
 fn entry_table(app: &App, entries: &[Entry]) -> Table<'static> {
@@ -179,14 +229,18 @@ fn preview(frame: &mut Frame, app: &mut App, area: Rect) {
         let count = entry.count.map_or("can't read this folder".into(), |c| {
             files::plural(c, "item")
         });
+        let counts = app.index.counts(Some(&entry.path)).unwrap_or_default();
         let status = match app.lit_root(&entry.path) {
             Some(root) if root == entry.path => Line::from(vec![
                 Span::styled("✦ lit", fg(AMBER)),
-                Span::styled(" · not indexed yet, no agent connected", fg(DIM)),
+                Span::styled(progress(counts), fg(DIM)),
             ]),
             Some(root) => Line::from(vec![
                 Span::styled("✦ lit", fg(AMBER)),
-                Span::styled(format!(" via {}", files::display_name(root)), fg(DIM)),
+                Span::styled(
+                    format!(" via {}{}", files::display_name(root), progress(counts)),
+                    fg(DIM),
+                ),
             ]),
             None => Line::from(vec![
                 Span::styled("○ not lit · press ", fg(DIM)),
@@ -214,22 +268,75 @@ fn preview(frame: &mut Frame, app: &mut App, area: Rect) {
     if let Some(modified) = entry.modified {
         details += &format!(" · modified {}", files::age(modified));
     }
-    let status = match app.lit_root(&entry.path) {
-        Some(_) => Line::from(vec![
+    let info = app.index.file(&entry.path).ok().flatten();
+    let status = match (&info, app.lit_root(&entry.path)) {
+        (_, None) => Line::styled("○ not indexed: this folder isn't lit", fg(DIM)),
+        (None, Some(_)) => Line::from(vec![
             Span::styled("✦ in a lit folder", fg(AMBER)),
-            Span::styled(" · not indexed yet, no agent connected", fg(DIM)),
+            Span::styled(" · not something an agent can read yet", fg(DIM)),
         ]),
-        None => Line::styled("○ not indexed: this folder isn't lit", fg(DIM)),
+        (Some(info), Some(_)) => match info.state {
+            State::Indexed => Line::from(vec![
+                Span::styled("✦ indexed", fg(AMBER)),
+                Span::styled(
+                    info.agent
+                        .as_ref()
+                        .map(|a| format!(" by {a}"))
+                        .unwrap_or_default(),
+                    fg(DIM),
+                ),
+            ]),
+            State::Pending => Line::from(vec![
+                Span::styled("✦ in a lit folder", fg(AMBER)),
+                Span::styled(" · waiting for the agent", fg(DIM)),
+            ]),
+            State::Sensitive => Line::styled(
+                format!(
+                    "⚿ kept local: holds {}",
+                    info.note.as_deref().unwrap_or("a secret")
+                ),
+                fg(RED),
+            ),
+            State::Failed => Line::styled(
+                format!(
+                    "✕ not indexed: {}",
+                    info.note.as_deref().unwrap_or("failed")
+                ),
+                fg(RED),
+            ),
+        },
     };
     let mut lines = vec![
         Line::styled(entry.name.clone(), fg(if is_image { IMAGE } else { FG })),
         Line::styled(details, fg(DIM)),
         status,
     ];
+    if let Some(description) = info.and_then(|i| i.description) {
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            description.title,
+            fg(AMBER).add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::styled(description.summary, fg(FG)));
+        if !description.tags.is_empty() {
+            lines.push(Line::styled(
+                description
+                    .tags
+                    .iter()
+                    .map(|t| format!("#{t}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                fg(DIR),
+            ));
+        }
+    }
+    // The agent's summary wraps, so measure the details before fitting the image or text around them.
+    let info = Paragraph::new(lines).wrap(Wrap { trim: true });
+    let info_height = (info.line_count(area.width) as u16).min(area.height);
     if is_image {
         // The image goes on top with its details right underneath, as in the mockup.
         let path = entry.path.clone();
-        let max_height = area.height.saturating_sub(lines.len() as u16 + 1);
+        let max_height = area.height.saturating_sub(info_height + 1);
         let used = match app.images.get(&path) {
             Some(Preview::Ready(protocol)) => {
                 let resize = Resize::Fit(Some(FilterType::Triangle));
@@ -260,15 +367,18 @@ fn preview(frame: &mut Frame, app: &mut App, area: Rect) {
             height: area.height.saturating_sub(used + 1),
             ..area
         };
-        frame.render_widget(Paragraph::new(lines), below);
+        frame.render_widget(info, below);
         return;
     }
-    lines.push(rule);
-    match files::text_head(&entry.path, area.height as usize) {
-        Some(text) => lines.extend(text.into_iter().map(|l| Line::styled(l, fg(FG)))),
-        None => lines.push(Line::styled("binary file", fg(DIM))),
+    let [top, rest] =
+        Layout::vertical([Constraint::Length(info_height), Constraint::Fill(1)]).areas(area);
+    frame.render_widget(info, top);
+    let mut text = vec![rule];
+    match files::text_head(&entry.path, rest.height as usize) {
+        Some(head) => text.extend(head.into_iter().map(|l| Line::styled(l, fg(FG)))),
+        None => text.push(Line::styled("binary file", fg(DIM))),
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(text), rest);
 }
 
 fn footer(frame: &mut Frame, app: &App, area: Rect) {

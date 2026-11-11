@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use image::metadata::Orientation;
-use image::{DynamicImage, ImageDecoder, ImageError, ImageReader};
+use image::{DynamicImage, ImageError};
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 
@@ -121,18 +120,7 @@ impl Images {
 }
 
 fn decode(path: &Path) -> Result<DynamicImage, String> {
-    let load = || -> image::ImageResult<DynamicImage> {
-        let mut decoder = ImageReader::open(path)?
-            .with_guessed_format()?
-            .into_decoder()?;
-        // Phone photos are often stored sideways with an EXIF flag saying how to rotate them.
-        // A malformed EXIF block shouldn't cost the whole preview.
-        let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-        let mut image = DynamicImage::from_decoder(decoder)?.thumbnail(MAX_SIDE, MAX_SIDE);
-        image.apply_orientation(orientation);
-        Ok(image)
-    };
-    load().map_err(|e| match e {
+    lantern_core::image::load(path, MAX_SIDE).map_err(|e| match e {
         ImageError::Unsupported(_) => "no preview for this format".to_string(),
         e => format!("can't preview: {e}"),
     })

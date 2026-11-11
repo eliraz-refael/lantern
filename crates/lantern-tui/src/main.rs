@@ -6,10 +6,10 @@ mod ui;
 
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use lantern_core::Index;
+use lantern_core::{AgentStatus, Counts, Index};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::TableState;
@@ -17,6 +17,12 @@ use ratatui_image::picker::Picker;
 
 use crate::files::{Entry, Kind};
 use crate::images::Images;
+
+/// How often the index is re-read to follow the agent.
+const REFRESH: Duration = Duration::from_secs(1);
+
+/// The daemon writes its status every few seconds; older than this, it has stopped.
+const DAEMON_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn main() -> anyhow::Result<()> {
     let db = Index::default_path().context("could not determine a home directory")?;
@@ -88,7 +94,9 @@ struct App {
     index: Index,
     /// Folders lit directly. Their subfolders are lit through them.
     lit: Vec<PathBuf>,
-    indexed: u64,
+    counts: Counts,
+    /// The daemon's agent, if the daemon is running.
+    agent: Option<AgentStatus>,
     home: Option<PathBuf>,
     cwd: PathBuf,
     entries: Vec<Entry>,
@@ -98,6 +106,7 @@ struct App {
     /// One-line message shown in the footer until the next key press.
     status: Option<String>,
     images: Images,
+    last_reload: Instant,
 }
 
 impl App {
@@ -105,7 +114,8 @@ impl App {
         let mut app = Self {
             index,
             lit: Vec::new(),
-            indexed: 0,
+            counts: Counts::default(),
+            agent: None,
             home: directories::BaseDirs::new().map(|d| d.home_dir().to_owned()),
             cwd: PathBuf::new(),
             entries: Vec::new(),
@@ -114,6 +124,7 @@ impl App {
             show_hidden: false,
             status: None,
             images,
+            last_reload: Instant::now(),
         };
         app.reload_index()?;
         app.open(cwd, None);
@@ -127,9 +138,26 @@ impl App {
             if redraw {
                 terminal.draw(|frame| ui::draw(frame, self))?;
             }
-            // While an image is decoding, wake up regularly to pick it up; otherwise wait for input.
-            if self.images.is_loading() && !event::poll(Duration::from_millis(50))? {
+            // While an image is decoding, wake up often to pick it up; otherwise wake up now and
+            // then to follow the agent's progress.
+            let wait = if self.images.is_loading() {
+                Duration::from_millis(50)
+            } else {
+                REFRESH
+            };
+            if !event::poll(wait)? {
                 redraw = self.images.receive();
+                if self.last_reload.elapsed() >= REFRESH {
+                    // A busy index is read again on the next refresh; it shouldn't close the TUI.
+                    match self.reload_index() {
+                        Ok(changed) => redraw |= changed,
+                        Err(e) => {
+                            self.last_reload = Instant::now();
+                            self.status = Some(format!("error: {e:#}"));
+                            redraw = true;
+                        }
+                    }
+                }
                 continue;
             }
             redraw = true;
@@ -229,7 +257,9 @@ impl App {
         match self.lit_root(&target).map(Path::to_path_buf) {
             Some(root) if root == target => {
                 self.index.unlight(&target)?;
-                self.status = Some(format!("○ {name} is no longer lit"));
+                self.status = Some(format!(
+                    "○ {name} is no longer lit, and its descriptions are forgotten"
+                ));
             }
             Some(root) => {
                 let via = files::display_name(&root);
@@ -237,18 +267,31 @@ impl App {
             }
             None => {
                 self.index.light(&target)?;
-                self.status = Some(format!(
-                    "✦ lit {name}. Nothing is read until an agent is connected"
-                ));
+                self.status = Some(match &self.agent {
+                    Some(agent) => format!("✦ lit {name}. {} will describe its files", agent.agent),
+                    None => format!("✦ lit {name}. Start lantern-daemon to index it"),
+                });
             }
         }
-        self.reload_index()
+        self.reload_index().map(|_| ())
     }
 
-    fn reload_index(&mut self) -> anyhow::Result<()> {
-        self.lit = self.index.lit_folders()?;
-        self.indexed = self.index.file_count()?;
-        Ok(())
+    /// Re-reads lit folders, counts and the agent's status. Returns true if any changed.
+    fn reload_index(&mut self) -> anyhow::Result<bool> {
+        let lit = self.index.lit_folders()?;
+        let counts = self.index.counts(None)?;
+        // A daemon that stopped beating is no longer running its agent.
+        let agent = self.index.agent_status()?.filter(|s| {
+            s.heartbeat
+                .elapsed()
+                .map_or(true, |age| age < DAEMON_TIMEOUT)
+        });
+        let changed = lit != self.lit || counts != self.counts || agent != self.agent;
+        self.lit = lit;
+        self.counts = counts;
+        self.agent = agent;
+        self.last_reload = Instant::now();
+        Ok(changed)
     }
 
     fn selected(&self) -> Option<&Entry> {
