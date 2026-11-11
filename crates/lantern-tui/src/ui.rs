@@ -1,13 +1,15 @@
 //! Drawing: header, parent / current / preview columns, footer. Colors follow the design mockup.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table, TableState};
+use ratatui_image::{FilterType, Resize, StatefulImage};
 
 use crate::App;
 use crate::files::{self, Entry, Kind};
+use crate::images::Preview;
 
 const AMBER: Color = Color::Rgb(0xff, 0xb5, 0x47);
 const AMBER_DIM: Color = Color::Rgb(0x8c, 0x67, 0x2e);
@@ -103,6 +105,9 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
         None => {}
     }
     let right = Line::from(vec![
+        Span::styled("images: ", fg(DIM)),
+        Span::styled(app.images.protocol_name(), fg(FG)),
+        sep(),
         Span::styled("no agent", fg(DIM)),
         sep(),
         Span::styled(app.lit.len().to_string(), fg(FG)),
@@ -162,7 +167,7 @@ fn entry_row(app: &App, entry: &Entry) -> Row<'static> {
     ])
 }
 
-fn preview(frame: &mut Frame, app: &App, area: Rect) {
+fn preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let area = Block::new().padding(Padding::horizontal(2)).inner(area);
     let Some(entry) = app.selected() else {
         frame.render_widget(Line::styled("empty", fg(DIM)), area);
@@ -223,12 +228,46 @@ fn preview(frame: &mut Frame, app: &App, area: Rect) {
         rule,
     ];
     if is_image {
-        lines.push(Line::styled("image previews come later", fg(DIM)));
-    } else {
-        match files::text_head(&entry.path, area.height as usize) {
-            Some(text) => lines.extend(text.into_iter().map(|l| Line::styled(l, fg(FG)))),
-            None => lines.push(Line::styled("binary file", fg(DIM))),
-        }
+        // The image goes on top with its details right underneath, as in the mockup.
+        lines.truncate(3);
+        let path = entry.path.clone();
+        let max_height = area.height.saturating_sub(lines.len() as u16 + 1);
+        let used = match app.images.get(&path) {
+            Some(Preview::Ready(protocol)) => {
+                let resize = Resize::Fit(Some(FilterType::Triangle));
+                let size = protocol.size_for(resize.clone(), Size::new(area.width, max_height));
+                let rect = Rect {
+                    width: size.width,
+                    height: size.height,
+                    ..area
+                };
+                frame.render_stateful_widget(
+                    StatefulImage::default().resize(resize),
+                    rect,
+                    protocol,
+                );
+                size.height
+            }
+            Some(Preview::Failed(message)) => {
+                frame.render_widget(Line::styled(message.clone(), fg(DIM)), area);
+                1
+            }
+            _ => {
+                frame.render_widget(Line::styled("loading…", fg(DIM)), area);
+                1
+            }
+        };
+        let below = Rect {
+            y: area.y + used + 1,
+            height: area.height.saturating_sub(used + 1),
+            ..area
+        };
+        frame.render_widget(Paragraph::new(lines), below);
+        return;
+    }
+    match files::text_head(&entry.path, area.height as usize) {
+        Some(text) => lines.extend(text.into_iter().map(|l| Line::styled(l, fg(FG)))),
+        None => lines.push(Line::styled("binary file", fg(DIM))),
     }
     frame.render_widget(Paragraph::new(lines), area);
 }

@@ -6,5 +6,7 @@ edition.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 directories = "6.0.0"
+image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 lantern-core = { version = "0.1.0", path = "../lantern-core" }
 ratatui = "0.30.2"
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
