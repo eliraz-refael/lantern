@@ -7,14 +7,14 @@ use std::sync::{Arc, Mutex};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
-    ContentBlock, Implementation, InitializeRequest, McpServer, McpServerStdio, NewSessionRequest,
-    PermissionOptionKind, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
-    TextContent,
+    CloseSessionRequest, ContentBlock, Implementation, InitializeRequest, McpServer,
+    McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, TextContent,
 };
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, LineDirection};
 use anyhow::Context;
-use lantern_core::{AgentState, Index};
+use lantern_core::{AgentState, Index, State};
 use serde_json::json;
 
 use crate::status::Status;
@@ -107,20 +107,31 @@ pub async fn run(run: Run<'_>, index: Arc<Mutex<Index>>, status: &Status) -> any
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(agent, async move |cx: ConnectionTo<Agent>| {
-            cx.send_request(
-                InitializeRequest::new(ProtocolVersion::V1)
-                    .client_info(Implementation::new("lantern", env!("CARGO_PKG_VERSION"))),
-            )
-            .block_task()
-            .await?;
+            let init = cx
+                .send_request(
+                    InitializeRequest::new(ProtocolVersion::V1)
+                        .client_info(Implementation::new("lantern", env!("CARGO_PKG_VERSION"))),
+                )
+                .block_task()
+                .await?;
+            let can_close = init.agent_capabilities.session_capabilities.close.is_some();
+            let lit = index
+                .lock()
+                .unwrap()
+                .lit_folders()
+                .map_err(anyhow::Error::from)?;
 
             loop {
-                let batch = index
-                    .lock()
-                    .unwrap()
-                    .pending(BATCH)
-                    .map_err(anyhow::Error::from)?;
-                if batch.is_empty() {
+                let (batch, lit_now) = {
+                    let index = index.lock().unwrap();
+                    (
+                        index.pending(BATCH).map_err(anyhow::Error::from)?,
+                        index.lit_folders().map_err(anyhow::Error::from)?,
+                    )
+                };
+                // A newly lit folder needs a scan, which happens between runs; don't make it
+                // wait for the whole queue.
+                if batch.is_empty() || lit_now != lit {
                     return Ok(());
                 }
                 let paths: Vec<PathBuf> = batch.into_iter().map(|(path, _)| path).collect();
@@ -135,25 +146,63 @@ pub async fn run(run: Run<'_>, index: Arc<Mutex<Index>>, status: &Status) -> any
                 // Counted once the agent took a session but before the prompt, so a file that
                 // crashes the agent is eventually given up on, while an agent that can't start a
                 // session (not logged in, say) doesn't use up the files' attempts.
-                index
+                let paths = index
                     .lock()
                     .unwrap()
                     .record_attempt(&paths)
                     .map_err(anyhow::Error::from)?;
-                status.set(
-                    AgentState::Working,
-                    Some(&format!(
-                        "{} is describing {} files",
-                        spec.name,
-                        paths.len()
-                    )),
-                );
-                let prompt = ContentBlock::Text(TextContent::new(prompt(&paths)));
-                let response = cx
-                    .send_request(PromptRequest::new(session.session_id, vec![prompt]))
-                    .block_task()
-                    .await?;
+                let session_id = session.session_id;
+                let response = if paths.is_empty() {
+                    None
+                } else {
+                    status.set(
+                        AgentState::Working,
+                        Some(&format!(
+                            "{} is describing {} files",
+                            spec.name,
+                            paths.len()
+                        )),
+                    );
+                    let prompt = ContentBlock::Text(TextContent::new(prompt(&paths)));
+                    Some(
+                        cx.send_request(PromptRequest::new(session_id.clone(), vec![prompt]))
+                            .block_task()
+                            .await,
+                    )
+                };
+                // Each open session keeps an agent process of its own alive.
+                if can_close {
+                    let closed = cx
+                        .send_request(CloseSessionRequest::new(session_id))
+                        .block_task()
+                        .await;
+                    if let Err(e) = closed {
+                        tracing::debug!("closing the session failed: {e}");
+                    }
+                }
+                let Some(response) = response else {
+                    continue;
+                };
+                let response = response?;
                 tracing::info!(files = paths.len(), stop = ?response.stop_reason, "batch done");
+                // An agent that describes nothing is failing (offline, rate limited, out of
+                // credit), not struggling with these files: back off instead of spending every
+                // file's attempts on it.
+                let progressed = {
+                    let index = index.lock().unwrap();
+                    paths.iter().any(|path| {
+                        index
+                            .file(path)
+                            .ok()
+                            .flatten()
+                            .is_none_or(|info| info.state != State::Pending)
+                    })
+                };
+                if !progressed {
+                    let error =
+                        anyhow::anyhow!("{} described none of {} files", spec.name, paths.len());
+                    return Err(error.into());
+                }
             }
         })
         .await?;
@@ -239,8 +288,9 @@ fn prompt(paths: &[PathBuf]) -> String {
         "Lantern is indexing these files so the user can find them later by describing what \
          they're looking for. For each file, in order:
 
-1. Call read_file with its path.
-2. Call save_file with its path and:
+1. Call read_file from the lantern MCP server with its path. Your own file tools can't see \
+   these files.
+2. Call save_file from the lantern MCP server with its path and:
    - title: what it is in a few words, like a good file name a person would pick \
      (\"Rudder repair at the boatyard\", \"Car insurance renewal 2023\").
    - summary: one to three sentences on what it contains. Mention what someone might search \

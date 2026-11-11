@@ -77,10 +77,17 @@ pub(crate) struct Seen {
 }
 
 /// Collects the visible regular files under `root`. Symlinks are skipped so a walk never leaves the
-/// folder, and `other_roots` are left to their own walk. Returns false if `root` can't be read.
-pub(crate) fn walk(root: &Path, other_roots: &[PathBuf], out: &mut Vec<Seen>) -> bool {
+/// folder, and `other_roots` are left to their own walk. Folders that can't be read, `root` or
+/// any below it, are added to `unreadable`.
+pub(crate) fn walk(
+    root: &Path,
+    other_roots: &[PathBuf],
+    out: &mut Vec<Seen>,
+    unreadable: &mut Vec<PathBuf>,
+) {
     let Ok(read) = fs::read_dir(root) else {
-        return false;
+        unreadable.push(root.to_owned());
+        return;
     };
     for entry in read.filter_map(Result::ok) {
         let name = entry.file_name();
@@ -94,7 +101,7 @@ pub(crate) fn walk(root: &Path, other_roots: &[PathBuf], out: &mut Vec<Seen>) ->
         let path = entry.path();
         if file_type.is_dir() {
             if !SKIPPED_DIRS.contains(&name.as_ref()) && !other_roots.contains(&path) {
-                walk(&path, other_roots, out);
+                walk(&path, other_roots, out, unreadable);
             }
         } else if file_type.is_file()
             && !is_generated(&name)
@@ -112,7 +119,6 @@ pub(crate) fn walk(root: &Path, other_roots: &[PathBuf], out: &mut Vec<Seen>) ->
             });
         }
     }
-    true
 }
 
 /// What kind of file this is, with the text an agent would see for text files, or None if an
@@ -167,7 +173,9 @@ mod tests {
         fs::write(dir.join("b/two.txt"), "2").unwrap();
 
         let mut out = Vec::new();
-        walk(&dir, &[dir.join("b")], &mut out);
+        let mut unreadable = Vec::new();
+        walk(&dir, &[dir.join("b")], &mut out, &mut unreadable);
+        assert!(unreadable.is_empty());
         let names: Vec<_> = out
             .iter()
             .map(|s| s.path.strip_prefix(&dir).unwrap())

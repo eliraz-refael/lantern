@@ -148,7 +148,15 @@ impl App {
             if !event::poll(wait)? {
                 redraw = self.images.receive();
                 if self.last_reload.elapsed() >= REFRESH {
-                    redraw |= self.reload_index()?;
+                    // A busy index is read again on the next refresh; it shouldn't close the TUI.
+                    match self.reload_index() {
+                        Ok(changed) => redraw |= changed,
+                        Err(e) => {
+                            self.last_reload = Instant::now();
+                            self.status = Some(format!("error: {e:#}"));
+                            redraw = true;
+                        }
+                    }
                 }
                 continue;
             }

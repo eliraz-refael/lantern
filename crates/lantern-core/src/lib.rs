@@ -241,7 +241,7 @@ impl Index {
     pub fn scan(&mut self) -> Result<ScanReport> {
         let roots = self.lit_folders()?;
         let mut seen = Vec::new();
-        // A root that can't be read (an unmounted drive, say) keeps what's known about it.
+        // A folder that can't be read (an unmounted drive, say) keeps what's known about it.
         let mut unreadable = Vec::new();
         for (i, root) in roots.iter().enumerate() {
             let others: Vec<PathBuf> = roots
@@ -250,9 +250,7 @@ impl Index {
                 .filter(|&(j, _)| j != i)
                 .map(|(_, r)| r.clone())
                 .collect();
-            if !scan::walk(root, &others, &mut seen) {
-                unreadable.push(root.clone());
-            }
+            scan::walk(root, &others, &mut seen, &mut unreadable);
         }
 
         let known: HashMap<String, (i64, i64, String)> = {
@@ -281,10 +279,18 @@ impl Index {
                 }
                 _ => {}
             }
-            let Ok(Some((kind, text))) = scan::classify(&file.path, file.size) else {
-                continue;
+            // A file that can't be read right now (locked by another program, say) isn't gone;
+            // keep what's known and look again next scan.
+            let (kind, text) = match scan::classify(&file.path, file.size) {
+                Ok(Some(classified)) => classified,
+                Ok(None) => continue,
+                Err(_) => {
+                    present.insert(path);
+                    continue;
+                }
             };
             let Ok(hash) = hash_file(&file.path) else {
+                present.insert(path);
                 continue;
             };
             match known.get(&path) {
@@ -391,23 +397,29 @@ impl Index {
         Ok(out)
     }
 
-    /// Counts a request to the agent against each file that's still pending, and gives up on
-    /// files that have had [`MAX_ATTEMPTS`].
-    pub fn record_attempt(&mut self, paths: &[PathBuf]) -> Result<()> {
+    /// Counts a request to the agent against each file that's still pending, giving up instead on
+    /// files that have already had [`MAX_ATTEMPTS`]. Returns the files to ask about.
+    pub fn record_attempt(&mut self, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
         let tx = self.conn.transaction()?;
+        let mut attempted = Vec::new();
         for path in paths {
-            tx.execute(
-                "UPDATE files SET attempts = attempts + 1 WHERE path = ?1 AND state = 'pending'",
-                params![path_str(path)?],
+            let p = path_str(path)?;
+            let given_up = tx.execute(
+                "UPDATE files SET state = 'failed', note = 'the agent did not describe it'
+                 WHERE path = ?1 AND state = 'pending' AND attempts >= ?2",
+                params![p, MAX_ATTEMPTS],
             )?;
+            if given_up == 0
+                && tx.execute(
+                    "UPDATE files SET attempts = attempts + 1 WHERE path = ?1 AND state = 'pending'",
+                    params![p],
+                )? == 1
+            {
+                attempted.push(path.clone());
+            }
         }
-        tx.execute(
-            "UPDATE files SET state = 'failed', note = 'the agent did not describe it'
-             WHERE state = 'pending' AND attempts >= ?1",
-            params![MAX_ATTEMPTS],
-        )?;
         tx.commit()?;
-        Ok(())
+        Ok(attempted)
     }
 
     /// The kind of a file the agent may read: one in a lit folder that isn't sensitive.
@@ -761,10 +773,14 @@ pub(crate) mod tests {
         let mut index = Index::open_in_memory().unwrap();
         index.light(&dir).unwrap();
         index.scan().unwrap();
+        let paths = std::slice::from_ref(&path);
         for _ in 0..MAX_ATTEMPTS {
             assert_eq!(index.pending(10).unwrap().len(), 1);
-            index.record_attempt(std::slice::from_ref(&path)).unwrap();
+            assert_eq!(index.record_attempt(paths).unwrap(), paths);
+            // The file stays readable for the attempt just counted.
+            assert_eq!(index.readable(&path).unwrap(), Some(FileKind::Text));
         }
+        assert!(index.record_attempt(paths).unwrap().is_empty());
         assert!(index.pending(10).unwrap().is_empty());
         assert_eq!(index.file(&path).unwrap().unwrap().state, State::Failed);
         assert!(
