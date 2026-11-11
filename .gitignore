@@ -1,0 +1,5 @@
+/target
+.direnv/
+
+# Design mockups use real personal photos and documents, so they stay local and out of this public repo.
+/mockups/

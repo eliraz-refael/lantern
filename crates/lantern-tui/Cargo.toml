@@ -1,0 +1,10 @@
+[package]
+name = "lantern-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+directories = "6.0.0"
+lantern-core = { version = "0.1.0", path = "../lantern-core" }
+ratatui = "0.30.2"
